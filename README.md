@@ -29,7 +29,7 @@ https://github.com/user-attachments/assets/489ec032-c238-4d7f-8d69-bb894ef1b40b
 | 选择集 | 1 | `select_entities` |
 | 图块管理 | 1 | `manage_block` |
 | 系统工具 | 3 | `get_variable`、`set_variable`、`get_app_info` |
-| 诊断工具 | 1 | `mech_diagnose`（机械模块连接与类型库诊断）|
+| 诊断工具 | 1 | `mech_diagnose`（机械后端、ZRX 桥接与连接诊断）|
 | 标题栏 | 1 | `manage_title_block` |
 | 图框 | 2 | `manage_frame`、`create_frame` |
 | 明细表 | 2 | `manage_bom`、`create_partlist` |
@@ -70,6 +70,8 @@ python server.py
 ```bash
 start.bat
 ```
+
+默认 `ZWMECH_BACKEND=auto` 会在服务启动时先探测 `pyzwcadmech`。如果 ZwmToolKit COM 接口不可用，服务会通过活动 ZWCAD 的 `Application.LoadZrx()` 自动加载 `ZWMechMCP.zrx`，再使用本机桥接执行机械接口；通常不需要预先手工加载插件。
 
 ### 4. 配置 MCP 客户端
 
@@ -196,7 +198,7 @@ start.bat
 
 | 工具 | 说明 |
 |------|------|
-| `mech_diagnose` | 诊断机械模块连接与 ZwmToolKit 类型库加载状态。逐项探测：类型库加载、ZWCAD 应用、ZwmApp、ZwmDb、标题栏获取，返回各探测项状态与修复建议。每次调用自动重置连接缓存以获取最新状态。 |
+| `mech_diagnose` | 诊断当前机械后端、`pyzwcadmech` 启动探测、ZRX 路径与桥接插件/版本/PID，并读取 ZWCAD、ZwmApp、ZwmDb、标题栏等状态。每次调用自动重置当前线程连接缓存。 |
 
 ### 标题栏
 
@@ -204,7 +206,7 @@ start.bat
 |------|------|--------|
 | `manage_title_block` | 标题栏读取/设置/批量更新 | `get_info`, `set_field`, `update_batch`, `get_field_count`, `get_field_by_index` |
 
-> ⚠️ 此工具依赖 ZwmToolKit 类型库，类型库未加载时将快速返回 `TYPELIB_NOT_LOADED` 错误。
+> 默认 `auto` 模式会先使用 `pyzwcadmech`，探测失败后自动切换到 ZRX；只有两条路径都不可用时才返回机械后端错误。
 
 ### 图框
 
@@ -213,7 +215,7 @@ start.bat
 | `manage_frame` | 图框查询/切换/更新/刷新 | `list`, `get_info`, `get_count`, `get_name_by_index`, `get_name_by_point`, `get_next_name`, `switch`, `update`, `refresh` |
 | `create_frame` | 新建图框（自动从XML配置读取默认样式） | - |
 
-> ⚠️ `create_frame` 以及 `manage_frame` 的 `get_info`/`update` 操作依赖类型库。`list`/`get_count`/`switch`/`refresh` 等操作不依赖类型库，在类型库未加载时仍可使用。
+> 图框操作使用当前选定的机械后端。默认优先 `pyzwcadmech`，故障时自动切换到 ZRX 桥接。
 
 ### 明细表（BOM）
 
@@ -222,7 +224,7 @@ start.bat
 | `manage_bom` | 明细表增删改查 | `get_row_count`, `get_row`, `add_row`, `update_row`, `insert_row`, `delete_row`, `set_field`, `get_field`, `get_field_count`, `batch_update`, `refresh` |
 | `create_partlist` | 创建明细表实体 | 发送 `_.ZwmPartlist` 命令 |
 
-> ⚠️ 除 `refresh` 外的所有操作依赖类型库。`refresh` 不依赖类型库，在类型库未加载时仍可使用。
+> BOM 操作使用当前选定的机械后端；默认模式下无需预先加载 ZRX。ZRX 缺失、端口被占用或 PID 不匹配时，错误详情可在 `mech_diagnose` 中查看。
 >
 > 💡 **BOM 持久化说明**：修改 BOM 数据后，`update_row`/`set_field`/`batch_update` 等操作会自动调用 `refresh_bom()` 将更改写入 DWG 图纸。请勿在 BOM 修改后调用 `manage_mech_db` 的 `save` 操作，`save` 会从图纸重载数据导致修改丢失。
 
@@ -236,7 +238,7 @@ start.bat
 | `get_balloon` | 获取球标对象用于零件编号标注 |
 | `insert_balloon` | 插入球标（零件序号标注），通过 LISP 命令 Zwm_BalloonInsert 实现。参数: 箭头位置/符号位置/文字/序号类型(0-6)/是否带引线 |
 
-> 以上工具不依赖类型库，在类型库未加载时仍可通过 late binding 正常工作。
+> 以上工具使用当前选定的机械后端。ZRX 回退覆盖当前 MCP 暴露的调用面，不承诺覆盖 `pyzwcadmech` 未被 MCP 使用的全部公开 API。
 
 ### 扩展数据
 
@@ -246,57 +248,44 @@ start.bat
 | `manage_xdata` | 实体扩展数据(XData)读写 | `get`, `set`, `list_apps`, `add_app` |
 | `manage_utility` | CAD工具方法（坐标转换/距离/角度计算/关键字输入等） | `distance`, `angle`, `polar`, `translate_coords`, `get_real`, `get_keyword` |
 
-## ZwmToolKit 类型库加载机制
+## 机械后端自动回退
 
-机械模块（标题栏/明细表/图框等）依赖 `ZwmToolKit.tlb` 类型库。`pyzwcadmech.api` 采用 **5 级回退策略** 加载类型库，确保在各种安装环境下都能成功加载：
+`mechanical_backend.py` 在 MCP 开始接受请求前选择机械后端。`ZWMECH_BACKEND` 支持以下模式：
 
-| 优先级 | 策略 | 说明 |
-|--------|------|------|
-| 1 | 文件系统 glob | 在 `C:\Program Files\ZWSOFT\ZWCAD Mechanical*\Zwcadm\` 下搜索 `ZwmToolKit*.tlb`，按版本年份排序优先选最新 |
-| 2 | 环境变量 | 读取 `PYZWCADMECH_TLB_PATH` 环境变量指向的 `.tlb` 文件 |
-| 3 | 本地路径 | 搜索当前工作目录和包目录下的 `ZwmToolKit.tlb` |
-| 4 | 预生成模块 | 复用已生成的 `comtypes.gen.ZwmToolKitLib` 模块（如 server.py 预加载生成的） |
-| 5 | GUID 注册表 | 按类型库 GUID `{2F671C10-669F-11E7-91B7-BC5FF42AC839}` 从 Windows 注册表加载 |
+| 模式 | 行为 | 用途 |
+|------|------|------|
+| `auto`（默认） | 独立子进程探测 `pyzwcadmech`；失败后自动 `LoadZrx()` 并验证桥接。 | 日常使用 |
+| `pyzwcadmech` | 只使用 Python COM 路径；探测失败时机械功能降级。 | 主路径排查 |
+| `zrx` | 跳过 Python COM 探测，直接加载/验证 ZRX。 | 桥接验收 |
 
-### server.py 预加载
+启动探测为只读操作，检查类型库、机械版本、当前机械 DB、标题栏、BOM 和图框；没有相应图纸对象属于正常结果，调用异常才判定失败。探测放在带超时的子进程中，避免异常 COM 阻塞 MCP 启动。
 
-`server.py` 在导入 `pyzwcadmech` 之前，会先按 GUID 预加载类型库，提前生成 `comtypes.gen.ZwmToolKitLib` 模块。即使后续 `pyzwcadmech.api` 的文件搜索失败，也能通过策略 4 复用该预生成模块。
+ZRX 回退流程如下：
 
-### 运行时重试
+1. 将 `ZWMECH_ZRX_PATH` 按项目目录解析相对路径；默认使用 `zrx\ZWMechMCP.zrx`。也支持填写绝对路径覆盖默认值。
+2. 通过活动 `ZWCAD.Application.LoadZrx()` 加载插件。
+3. 轮询 `ZWMECH_BRIDGE_HOST:ZWMECH_BRIDGE_PORT` 的 `ping`。
+4. 校验插件标识 `ZWMechMCP`、版本和 `process_id`；PID 必须与 `Application.HWND` 所属 ZWCAD 进程一致。
 
-如果类型库在 import 时加载失败（例如 ZWCAD 尚未启动），`ZwCADMech.zwm_app` 属性在首次访问时会自动调用 `reload_typelib()` 重试加载。也可通过 `mech_diagnose` 工具触发重新诊断。
+运行期只从 `pyzwcadmech` 单向切换到 ZRX。只读操作切换成功后自动重试一次；写操作不会盲目重放，返回 `MECHANICAL_BACKEND_SWITCHED_RETRY_REQUIRED`，确认图纸状态后重新调用。参数错误、对象不存在和业务错误不会触发切换。两条路径均失败时服务仍启动，机械工具返回 `MECHANICAL_BACKEND_UNAVAILABLE`，基础 CAD 工具保持可用。
 
-### 环境变量配置
+### 环境变量
 
-如果类型库无法自动加载（如自定义安装路径），可设置环境变量：
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ZWMECH_BACKEND` | `auto` | `auto`、`pyzwcadmech` 或 `zrx`。 |
+| `ZWMECH_ZRX_PATH` | `zrx\\ZWMechMCP.zrx` | ZRX 回退插件路径；相对路径以当前项目目录为基准，也支持绝对路径。 |
+| `ZWMECH_BRIDGE_HOST` | `127.0.0.1` | 本机桥接地址，建议保持回环地址。 |
+| `ZWMECH_BRIDGE_PORT` | `17890` | ZRX HTTP/JSON 桥接端口。插件和 MCP 必须使用相同端口。 |
 
-```json
-{
-  "mcpServers": {
-    "zwcadmech": {
-      "command": "python",
-      "args": ["server.py"],
-      "env": {
-        "PYZWCADMECH_TLB_PATH": "C:\\Program Files\\ZWSOFT\\ZWCAD Mechanical 2026 Chs\\Zwcadm\\ZwmToolKit.tlb"
-      }
-    }
-  }
-}
+PowerShell 中可临时强制一路径：
+
+```powershell
+$env:ZWMECH_BACKEND = "zrx"
+python server.py
 ```
 
-### 类型库依赖矩阵
-
-| 工具 | 类型库未加载时 | 说明 |
-|------|--------------|------|
-| `manage_title_block` | ❌ 不可用 | 返回 `TYPELIB_NOT_LOADED` 错误 |
-| `create_frame` | ❌ 不可用 | 返回 `TYPELIB_NOT_LOADED` 错误 |
-| `manage_bom`（除 refresh） | ❌ 不可用 | 返回错误并附带修复提示 |
-| `manage_frame`（get_info/update） | ❌ 不可用 | 返回错误并附带修复提示 |
-| `manage_bom`（refresh） | ✅ 可用 | 通过 late binding 工作 |
-| `manage_frame`（list/switch/refresh 等） | ✅ 可用 | 通过 late binding 工作 |
-| `manage_mech_db` / `mech_doc` / `cad_environment_init` / `get_balloon` / `insert_balloon` | ✅ 可用 | 通过 late binding 工作 |
-| `get_app_info`（mech_* scope） | ✅ 可用 | 通过 late binding 工作 |
-| 所有 pyzwcad 基础工具（绘图/标注/变换/查询等） | ✅ 可用 | 完全不依赖类型库 |
+默认 `auto` 不要求预先手工加载插件。若需恢复或调试，可在 ZWCAD 中执行 `ZRXLOAD`/`APPLOAD`，然后执行 `ZWMMECHSTATUS`。使用 `mech_diagnose` 可查看当前后端、探测步骤、切换原因、ZRX 路径、桥接信息以及两条路径的错误。
 
 ## 示例：通过 AI 创建图框
 
@@ -320,7 +309,9 @@ create_frame(
 
 ```
 zwcad-mechanical-mcp-server/
-├── server.py                 # MCP Server 主程序（36个工具）
+├── server.py                 # MCP Server 主程序（37个工具）
+├── mechanical_backend.py     # 机械探测、选路与运行期回退
+├── mech_bridge.py            # ZRX HTTP/JSON 兼容层
 ├── requirements.txt          # Python 依赖
 ├── mcp-config.json           # MCP 客户端配置示例
 ├── start.bat                 # Windows 一键启动脚本
@@ -337,42 +328,30 @@ AI Client (Cursor/Claude/Qoder)
         │
         │ MCP Protocol (STDIO)
         ▼
-   FastMCP Server (server.py, 36 tools)
+   FastMCP Server (server.py, 37 tools)
         │
         ├── pyzwcad ──────► ZWCAD.Application COM API (基础绘图/标注/变换/查询)
         │                   └── 不依赖类型库，始终可用
         │
-        └── pyzwcadmech ──► ZwmToolKit COM API (机械功能)
-                │
-                ├── 类型库加载 (5级回退策略)
-                │   ├── 1. 文件 glob (版本感知排序)
-                │   ├── 2. PYZWCADMECH_TLB_PATH 环境变量
-                │   ├── 3. 本地路径
-                │   ├── 4. 预生成 comtypes.gen 模块
-                │   └── 5. GUID 注册表加载
-                │
-                ├── ZwmApp ──── 应用层 (版本/路径/文档操作) ── 不依赖类型库
-                ├── ZwmDb ──── 数据库层 (打开/保存/图框管理)
-                │   ├── open_file/save/close/switch_frame ── 不依赖类型库
-                │   ├── get_title() ──► ZwmTitle ── 依赖类型库
-                │   ├── get_bom() ────► ZwmBom ─── 依赖类型库
-                │   └── get_frame() ──► ZwmFrame ─ 依赖类型库
-                │
-                └── 运行时重试: zwm_app 属性在 ZWM=None 时自动调用 reload_typelib()
+        └── mechanical_backend.py ──► 机械后端自动选路
+                ├── pyzwcadmech ──► ZwmToolKit COM（默认主路径）
+                └── mech_bridge.py ──► HTTP/JSON ──► ZWMechMCP.zrx
+                                             LoadZrx 自动回退，插件/版本/PID 校验
+                                             ZWCAD 进程内调用 ZwmToolKit
 
-   连接缓存: get_cad_connection() 缓存 (ZwCAD, ZwCADMech) 实例
-   诊断工具: mech_diagnose() 每次调用自动重置连接缓存，逐项探测
+   连接缓存: CAD/机械 COM 代理按工作线程缓存，后端切换后按代次重建
+   诊断工具: mech_diagnose() 自动重置当前线程缓存并报告两条路径状态
 ```
 
 ## 重要说明
 
 1. **ZWCAD 必须运行**：所有工具调用都要求中望机械CAD 已启动并打开了 DWG 文件。
 
-2. **样式文件路径**：`create_frame` 工具从 XML 配置文件读取默认样式：`C:\Users\Public\Documents\ZWSoft\zwcadm\2026\zh-CN\styles`
+2. **样式文件路径**：`create_frame` 工具从 ZWCAD 的 XML 配置目录读取默认样式；实际目录随安装位置和语言版本变化。
 
-3. **类型库加载**：机械模块（标题栏/明细表/图框）依赖 ZwmToolKit 类型库。正常安装环境下会自动加载；如遇加载失败，可使用 `mech_diagnose` 工具诊断，或设置 `PYZWCADMECH_TLB_PATH` 环境变量指向 `ZwmToolKit.tlb` 文件。
+3. **机械后端**：默认先探测 `pyzwcadmech`，失败后自动对活动 ZWCAD 调用 `LoadZrx()`。手工 `ZRXLOAD`/`APPLOAD` 和 `ZWMMECHSTATUS` 仍可用于恢复、调试或强制 `ZWMECH_BACKEND=zrx` 验收。
 
-4. **连接缓存**：MCP Server 会缓存 CAD 连接实例以提高性能。`mech_diagnose` 工具每次调用会自动重置缓存以获取最新状态。
+4. **连接缓存**：连接按 MCP 工作线程隔离，避免跨 STA 复用 COM 代理。`mech_diagnose` 会重置当前线程缓存以获取最新状态。
 
 ## 依赖
 
@@ -409,7 +388,7 @@ A ZWCAD Mechanical CAD automation MCP service that allows AI models to directly 
 | Selection | 1 | `select_entities` |
 | Block | 1 | `manage_block` |
 | System | 3 | `get_variable`, `set_variable`, `get_app_info` |
-| Diagnostics | 1 | `mech_diagnose` (mechanical module & typelib diagnostics) |
+| Diagnostics | 1 | `mech_diagnose` (mechanical backend, ZRX bridge, and connection diagnostics) |
 | Title Block | 1 | `manage_title_block` |
 | Frame | 2 | `manage_frame`, `create_frame` |
 | BOM | 2 | `manage_bom`, `create_partlist` |
@@ -448,6 +427,8 @@ Or use the launcher:
 ```bash
 start.bat
 ```
+
+In the default `ZWMECH_BACKEND=auto` mode, MCP probes `pyzwcadmech` at startup. If the ZwmToolKit COM interfaces are unavailable, it calls `Application.LoadZrx()` on the active ZWCAD instance and uses the local ZRX bridge for mechanical operations; preloading the plugin is normally unnecessary.
 
 ### 4. Configure MCP Client
 
@@ -574,7 +555,7 @@ add tolerance to an existing dimension -> `modify_entity(entity_type="dimension"
 
 | Tool | Description |
 |------|-------------|
-| `mech_diagnose` | Diagnose mechanical module connection and ZwmToolKit type library loading status. Probes: typelib loading, ZWCAD app, ZwmApp, ZwmDb, title block retrieval. Auto-resets connection cache on each call. |
+| `mech_diagnose` | Reports the selected mechanical backend, `pyzwcadmech` startup probe, ZRX path, bridge plugin/version/PID, fallback reason, and ZWCAD/ZwmApp/ZwmDb/title block state. Resets the current worker connection cache on each call. |
 
 ### Title Block
 
@@ -582,7 +563,7 @@ add tolerance to an existing dimension -> `modify_entity(entity_type="dimension"
 |------|-------------|--------|
 | `manage_title_block` | Title block read/set/batch update | `get_info`, `set_field`, `update_batch`, `get_field_count`, `get_field_by_index` |
 
-> ⚠️ Requires ZwmToolKit type library. Returns `TYPELIB_NOT_LOADED` error if not loaded.
+> In default `auto` mode this first uses `pyzwcadmech` and then falls back to ZRX after a failed probe. A mechanical backend error is returned only when both routes are unavailable.
 
 ### Frame
 
@@ -591,7 +572,7 @@ add tolerance to an existing dimension -> `modify_entity(entity_type="dimension"
 | `manage_frame` | Frame query/switch/update/refresh | `list`, `get_info`, `get_count`, `get_name_by_index`, `get_name_by_point`, `get_next_name`, `switch`, `update`, `refresh` |
 | `create_frame` | Create a new frame (auto-reads XML default style config) | - |
 
-> ⚠️ `create_frame` and `manage_frame` `get_info`/`update` require type library. `list`/`get_count`/`switch`/`refresh` work without it.
+> Frame actions use the selected mechanical backend: `pyzwcadmech` by default, then the ZRX bridge after a qualifying failure.
 
 ### BOM (Bill of Materials)
 
@@ -600,7 +581,7 @@ add tolerance to an existing dimension -> `modify_entity(entity_type="dimension"
 | `manage_bom` | BOM CRUD operations | `get_row_count`, `get_row`, `add_row`, `update_row`, `insert_row`, `delete_row`, `set_field`, `get_field`, `get_field_count`, `batch_update`, `refresh` |
 | `create_partlist` | Create parts list entity | Sends `_.ZwmPartlist` command |
 
-> ⚠️ All actions except `refresh` require type library. `refresh` works without it.
+> BOM actions use the selected mechanical backend. The default mode does not require preloading ZRX; missing artifacts, occupied ports, or PID mismatches are reported by `mech_diagnose`.
 >
 > 💡 **BOM Persistence**: After modifying BOM data, `update_row`/`set_field`/`batch_update` automatically call `refresh_bom()` to write changes to the DWG. Do NOT call `manage_mech_db`'s `save` after BOM modifications, as `save` reloads data from the drawing and discards changes.
 
@@ -614,7 +595,7 @@ add tolerance to an existing dimension -> `modify_entity(entity_type="dimension"
 | `get_balloon` | Get balloon object for part numbering |
 | `insert_balloon` | Insert balloon (part number annotation) via LISP command Zwm_BalloonInsert. Params: arrow point/symbol point/text/seq type(0-6)/leader |
 
-> These tools work without type library via late binding.
+> These tools use the selected mechanical backend. The ZRX fallback covers the MCP call surface, not every public API exposed by `pyzwcadmech`.
 
 ### Extended Data
 
@@ -624,53 +605,44 @@ add tolerance to an existing dimension -> `modify_entity(entity_type="dimension"
 | `manage_xdata` | Entity extended data (XData) read/write | `get`, `set`, `list_apps`, `add_app` |
 | `manage_utility` | CAD utility methods (coordinate conversion/distance/angle/keyword input) | `distance`, `angle`, `polar`, `translate_coords`, `get_real`, `get_keyword` |
 
-## ZwmToolKit Type Library Loading
+## Automatic Mechanical Backend Fallback
 
-The mechanical module (title block / BOM / frame) depends on the `ZwmToolKit.tlb` type library. `pyzwcadmech.api` uses a **5-strategy fallback** to load it:
+Before accepting MCP requests, `mechanical_backend.py` selects one process-wide mechanical backend. `ZWMECH_BACKEND` supports:
 
-| Priority | Strategy | Description |
-|----------|----------|-------------|
-| 1 | File glob | Search `ZwmToolKit*.tlb` in `C:\Program Files\ZWSOFT\ZWCAD Mechanical*\Zwcadm\`, sort by version year (newest first) |
-| 2 | Env variable | Read `PYZWCADMECH_TLB_PATH` environment variable |
-| 3 | Local path | Search current working directory and package directory |
-| 4 | Pre-generated module | Reuse existing `comtypes.gen.ZwmToolKitLib` module |
-| 5 | GUID registry | Load by type library GUID from Windows registry |
+| Mode | Behavior | Use |
+|------|----------|-----|
+| `auto` (default) | Run a bounded child-process probe of `pyzwcadmech`; on failure call `LoadZrx()` and validate the bridge. | Normal operation |
+| `pyzwcadmech` | Use only the Python COM path; mechanical tools degrade if the probe fails. | Primary-route diagnosis |
+| `zrx` | Skip the Python COM probe and load/validate ZRX directly. | Bridge acceptance |
 
-### Runtime Retry
+The startup probe is read-only and checks the type library, mechanical version, current mechanical database, title block, BOM, and frame. Missing objects in the drawing are valid results; call exceptions are failures. Running the probe in a subprocess with a timeout prevents a stuck COM server from blocking MCP startup.
 
-If the type library fails to load at import time (e.g., ZWCAD not yet started), the `ZwCADMech.zwm_app` property automatically calls `reload_typelib()` on first access. The `mech_diagnose` tool can also trigger re-diagnosis.
+ZRX fallback:
 
-### Environment Variable
+1. Resolve `ZWMECH_ZRX_PATH` relative to the project directory; the default is `zrx\\ZWMechMCP.zrx`. An absolute path may also be supplied to override it.
+2. Call `Application.LoadZrx()` on the active `ZWCAD.Application` instance.
+3. Poll `ZWMECH_BRIDGE_HOST:ZWMECH_BRIDGE_PORT` for `ping`.
+4. Validate plugin `ZWMechMCP`, version, and `process_id`; the bridge PID must match the PID resolved from `Application.HWND`.
 
-If automatic loading fails (e.g., custom install path), set the environment variable:
+Runtime switching is one-way from `pyzwcadmech` to ZRX. Read-only operations retry once after a successful switch. Writes are not replayed and return `MECHANICAL_BACKEND_SWITCHED_RETRY_REQUIRED`; inspect the drawing before deliberately retrying. Parameter, missing-object, and ordinary business errors do not trigger a switch. If both routes fail, MCP still starts, mechanical tools return `MECHANICAL_BACKEND_UNAVAILABLE`, and basic CAD tools remain available.
 
-```json
-{
-  "mcpServers": {
-    "zwcadmech": {
-      "command": "python",
-      "args": ["server.py"],
-      "env": {
-        "PYZWCADMECH_TLB_PATH": "C:\\Program Files\\ZWSOFT\\ZWCAD Mechanical 2026 Chs\\Zwcadm\\ZwmToolKit.tlb"
-      }
-    }
-  }
-}
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ZWMECH_BACKEND` | `auto` | `auto`, `pyzwcadmech`, or `zrx`. |
+| `ZWMECH_ZRX_PATH` | `zrx\\ZWMechMCP.zrx` | Fallback ZRX path; relative values are based on the project directory, and absolute values are also supported. |
+| `ZWMECH_BRIDGE_HOST` | `127.0.0.1` | Local bridge address; keep it loopback-only. |
+| `ZWMECH_BRIDGE_PORT` | `17890` | Local HTTP/JSON bridge port. The plugin and MCP must use the same value. |
+
+PowerShell example:
+
+```powershell
+$env:ZWMECH_BACKEND = "zrx"
+python server.py
 ```
 
-### Type Library Dependency Matrix
-
-| Tool | When type library not loaded | Notes |
-|------|------------------------------|-------|
-| `manage_title_block` | ❌ Unavailable | Returns `TYPELIB_NOT_LOADED` error |
-| `create_frame` | ❌ Unavailable | Returns `TYPELIB_NOT_LOADED` error |
-| `manage_bom` (except refresh) | ❌ Unavailable | Returns error with fix hint |
-| `manage_frame` (get_info/update) | ❌ Unavailable | Returns error with fix hint |
-| `manage_bom` (refresh) | ✅ Available | Works via late binding |
-| `manage_frame` (list/switch/refresh etc.) | ✅ Available | Works via late binding |
-| `manage_mech_db` / `mech_doc` / `cad_environment_init` / `get_balloon` / `insert_balloon` | ✅ Available | Works via late binding |
-| `get_app_info` (mech_* scope) | ✅ Available | Works via late binding |
-| All pyzwcad basic tools (drawing/annotation/transform/query etc.) | ✅ Available | No type library dependency |
+In `auto` mode, preloading the plugin is normally unnecessary. For recovery or debugging, run `ZRXLOAD`/`APPLOAD` in ZWCAD and then `ZWMMECHSTATUS`. `mech_diagnose` reports the active backend, probe steps, fallback reason, ZRX path, bridge metadata, and errors from both routes.
 
 ## Example: Creating a Frame via AI
 
@@ -694,7 +666,9 @@ create_frame(
 
 ```
 zwcad-mechanical-mcp-server/
-├── server.py                 # MCP Server main program (36 tools)
+├── server.py                 # MCP Server main program (37 tools)
+├── mechanical_backend.py     # probe, route selection, and runtime fallback
+├── mech_bridge.py            # ZRX HTTP/JSON compatibility client
 ├── requirements.txt          # Python dependencies
 ├── mcp-config.json           # MCP client configuration example
 ├── start.bat                 # Windows one-click launcher
@@ -711,42 +685,30 @@ AI Client (Cursor/Claude/Qoder)
         │
         │ MCP Protocol (STDIO)
         ▼
-   FastMCP Server (server.py, 36 tools)
+   FastMCP Server (server.py, 37 tools)
         │
         ├── pyzwcad ──────► ZWCAD.Application COM API (basic drawing)
         │                   └── No type library dependency, always available
         │
-        └── pyzwcadmech ──► ZwmToolKit COM API (mechanical features)
-                │
-                ├── Type library loading (5-strategy fallback)
-                │   ├── 1. File glob (version-aware sorting)
-                │   ├── 2. PYZWCADMECH_TLB_PATH env variable
-                │   ├── 3. Local path
-                │   ├── 4. Pre-generated comtypes.gen module
-                │   └── 5. GUID registry loading
-                │
-                ├── ZwmApp ──── Application layer ── No type library dependency
-                ├── ZwmDb ──── Database layer
-                │   ├── open_file/save/close/switch_frame ── No dependency
-                │   ├── get_title() ──► ZwmTitle ── Requires type library
-                │   ├── get_bom() ────► ZwmBom ─── Requires type library
-                │   └── get_frame() ──► ZwmFrame ─ Requires type library
-                │
-                └── Runtime retry: zwm_app auto-calls reload_typelib() when ZWM=None
+        └── mechanical_backend.py ──► mechanical backend selection
+                ├── pyzwcadmech ──► ZwmToolKit COM (default primary route)
+                └── mech_bridge.py ──► HTTP/JSON ──► ZWMechMCP.zrx
+                                             LoadZrx fallback, plugin/version/PID validation
+                                             in-process ZwmToolKit calls
 
-   Connection cache: get_cad_connection() caches (ZwCAD, ZwCADMech) instances
-   Diagnostics: mech_diagnose() auto-resets cache, probes each component
+   Connection cache: CAD/mechanical COM proxies are per-worker and rebuilt after switching
+   Diagnostics: mech_diagnose() resets the current worker cache and reports both routes
 ```
 
 ## Important Notes
 
 1. **ZWCAD Must Be Running**: All tool calls require ZWCAD Mechanical to be running with a DWG file open.
 
-2. **Style File Path**: The `create_frame` tool reads default styles from XML config files: `C:\Users\Public\Documents\ZWSoft\zwcadm\2026\zh-CN\styles`
+2. **Style File Path**: The `create_frame` tool reads default styles from the ZWCAD XML configuration directory; the actual location depends on the installation and language.
 
-3. **Type Library Loading**: The mechanical module (title block / BOM / frame) depends on the ZwmToolKit type library. It loads automatically in normal installations. If loading fails, use the `mech_diagnose` tool to diagnose, or set the `PYZWCADMECH_TLB_PATH` environment variable to point to `ZwmToolKit.tlb`.
+3. **Mechanical backend**: The default flow probes `pyzwcadmech` first, then calls `LoadZrx()` on the active ZWCAD instance if the probe fails. Manual `ZRXLOAD`/`APPLOAD` and `ZWMMECHSTATUS` remain available for recovery, debugging, or forced `ZWMECH_BACKEND=zrx` validation.
 
-4. **Connection Cache**: The MCP Server caches CAD connection instances for performance. The `mech_diagnose` tool automatically resets the cache on each call for fresh diagnostics.
+4. **Connection Cache**: Connections are isolated per MCP worker to avoid cross-STA COM reuse. `mech_diagnose` resets the current worker cache for fresh diagnostics.
 
 ## Dependencies
 

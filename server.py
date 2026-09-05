@@ -9,6 +9,7 @@ import math
 import sys
 import os
 import logging
+import threading
 import pythoncom
 import xml.etree.ElementTree as ET
 
@@ -27,22 +28,12 @@ except Exception:
 from fastmcp import FastMCP
 from pyzwcad import ZwCAD, APoint
 from pyzwcad.types import aDouble, aInt
-
-# 预加载 ZwmToolKit 类型库（按 GUID 从注册表加载）。
-# pyzwcadmech.api 自身也有多策略回退加载（文件 glob / env / 预生成模块 / GUID），此处预加载可提前生成 comtypes.gen 模块。
-ZWM_TYPELIB_GUID = "{2F671C10-669F-11E7-91B7-BC5FF42AC839}"
-try:
-    import comtypes.client
-    comtypes.client.GetModule((ZWM_TYPELIB_GUID, 1, 0))
-    logger.info("预加载 ZwmToolKit 类型库成功 (GUID=%s)", ZWM_TYPELIB_GUID)
-except Exception as _tlb_err:
-    logger.warning(
-        "预加载 ZwmToolKit 类型库失败: %s; pyzwcadmech.api 将尝试回退策略",
-        _tlb_err,
-    )
-
-from pyzwcadmech import ZwCADMech
 from hatch_info import extract_hatch_loops
+from mechanical_backend import (
+    MechanicalBackendError,
+    MechanicalBackendManager,
+    MechanicalBackendUnavailable,
+)
 
 mcp = FastMCP(name="ZWCAD Mechanical Drawing Server")
 
@@ -157,35 +148,44 @@ def _get_default_frame_size(standard_name):
     return "A3"
 
 
-_cad_conn_cache = None
+_thread_state = threading.local()
+_mechanical_backend = MechanicalBackendManager()
 
 
 def get_cad_connection():
-    global _cad_conn_cache
-    if _cad_conn_cache is not None:
+    """Return apartment-local CAD and selected mechanical backend connections."""
+    generation = _mechanical_backend.generation
+    cached = getattr(_thread_state, "cad_conn", None)
+    if cached is not None and cached[0] == generation:
         try:
-            # 健康检查：确认缓存的 zcad_conn 仍可访问 ModelSpace。
-            # comtypes 的 ZWCAD.Application 代理在长期运行后会失效
-            # (CO_E_OBJNOTCONNECTED -2147220995)，导致 doc/model 不可用，
-            # 表现为绘图类工具报“对象没有连接到服务器”而应用层工具仍正常。
-            _ = _cad_conn_cache[0].model.Count
-            return _cad_conn_cache
+            _ = cached[1].model.Count
+            return cached[1], cached[2]
         except Exception:
-            _cad_conn_cache = None
+            _thread_state.cad_conn = None
     try:
         pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
     except Exception:
         pass
+
+    if _mechanical_backend.backend == "uninitialized":
+        _mechanical_backend.preflight()
     zcad_conn = ZwCAD()
-    mech_conn = ZwCADMech()
-    _cad_conn_cache = (zcad_conn, mech_conn)
-    return _cad_conn_cache
+    try:
+        mech_conn = _mechanical_backend.create_connection(zcad_conn.app)
+    except MechanicalBackendError as exc:
+        logger.warning("机械后端连接创建失败: %s", exc)
+        _mechanical_backend.preflight()
+        mech_conn = _mechanical_backend.create_connection(zcad_conn.app)
+
+    generation = _mechanical_backend.generation
+    _thread_state.cad_conn = (generation, zcad_conn, mech_conn)
+    return zcad_conn, mech_conn
 
 
 def reset_cad_connection():
-    """清除连接缓存，下次 get_cad_connection 将创建新连接。"""
-    global _cad_conn_cache, _styles_base_path_cache
-    _cad_conn_cache = None
+    """Clear the current worker's COM proxies and style path cache."""
+    global _styles_base_path_cache
+    _thread_state.cad_conn = None
     _styles_base_path_cache = None
 
 
@@ -195,53 +195,55 @@ def _ok(message: str = None, **data) -> dict:
     return data
 
 
-def _typelib_state():
-    """返回 (loaded, source, error)：ZwmToolKit 类型库加载状态。"""
-    try:
-        from pyzwcadmech import api as _zwm_api
-        loaded = getattr(_zwm_api, "ZWM", None) is not None
-        source = getattr(_zwm_api, "TYPELIB_SOURCE", None)
-        if source is None and loaded:
-            source = getattr(_zwm_api, "tlb_path", None) or getattr(_zwm_api, "found_tlb", None) or "loaded"
-        tlb_err = getattr(_zwm_api, "TYPELIB_ERROR", None)
-        return loaded, source, tlb_err
-    except Exception as exc:
-        return False, None, str(exc)
-
-
-def _require_typelib(action: str):
-    """检查 ZwmToolKit 类型库是否已加载，未加载则返回错误 dict，否则返回 None。"""
-    loaded, source, tlb_err = _typelib_state()
-    if not loaded:
-        hint_parts = [
-            "ZwmToolKit 类型库未加载，标题栏/明细表/图框等机械接口不可用。",
-            "修复方法: 1) 确认中望机械已安装并启动; "
-            "2) 设置环境变量 PYZWCADMECH_TLB_PATH 指向 ZwmToolKit.tlb; "
-            "3) 调用 mech_diagnose 排查; 4) 重启 MCP Server。",
-        ]
-        if tlb_err:
-            hint_parts.append(f"错误详情: {tlb_err}")
-        return {"error": f"{action}失败: ZwmToolKit 类型库未加载", "code": "TYPELIB_NOT_LOADED", "hint": " ".join(hint_parts)}
-    return None
-
-
 def _err(action: str, e: Exception) -> dict:
     err_str = str(e)
     is_com = "CoInitialize" in err_str or "-2147221008" in err_str
     logger.error("tool_error action=%s error=%s", action, err_str)
-    result = {"error": f"{action}失败: {err_str}", "code": "COM_INIT_ERROR" if is_com else "OPERATION_ERROR"}
+    backend_state = _mechanical_backend.snapshot()
+    if isinstance(e, MechanicalBackendUnavailable):
+        code = "MECHANICAL_BACKEND_UNAVAILABLE"
+    else:
+        code = "COM_INIT_ERROR" if is_com else "OPERATION_ERROR"
+    result = {"error": f"{action}失败: {err_str}", "code": code}
     hints = []
     if is_com:
         hints.append("确保中望机械已启动; 重启ZWCAD和MCP Server; 检查pywin32/comtypes")
-    _tlb_loaded, _tlb_src, _tlb_err = _typelib_state()
-    if not _tlb_loaded:
+    if backend_state["active_backend"] == "unavailable":
         hints.append(
-            "检测到 ZwmToolKit 类型库未加载，标题栏/明细表/图框等机械接口将不可用; "
-            "可设置环境变量 PYZWCADMECH_TLB_PATH 指向 ZwmToolKit.tlb 后重启 MCP Server"
+            "机械后端不可用。请检查 mech_diagnose 返回的 pyzwcadmech 探测和 ZRX 加载错误。"
         )
     if hints:
         result["hint"] = "; ".join(hints)
     return result
+
+
+def _run_mechanical(action: str, operation, read_only: bool = False) -> dict:
+    """Run one mechanical tool and safely fail over from Python COM to ZRX."""
+    try:
+        return operation()
+    except Exception as exc:
+        cad_app = None
+        try:
+            cad_app = get_cad_connection()[0].app
+        except Exception:
+            try:
+                cad_app = ZwCAD().app
+            except Exception:
+                pass
+
+        switched = cad_app is not None and _mechanical_backend.failover_from_pyzwcadmech(cad_app, exc)
+        if switched:
+            reset_cad_connection()
+            if read_only:
+                try:
+                    return operation()
+                except Exception as retry_exc:
+                    return _err(action, retry_exc)
+            result = _err(action, exc)
+            result["code"] = "MECHANICAL_BACKEND_SWITCHED_RETRY_REQUIRED"
+            result["hint"] = "机械后端已切换到 ZRX；为避免重复写入，本次操作未自动重试，请重新调用。"
+            return result
+        return _err(action, exc)
 
 
 def _find_entity(zcad_conn, object_type: str = None,
@@ -2246,9 +2248,9 @@ def set_variable(name: str, value) -> dict:
 @mcp.tool
 def get_app_info(scope: str = "cad") -> dict:
     """获取应用信息。scope: cad(ZWCAD版本/路径/窗口)|mech_version|mech_cad_path|mech_zwm_path|mech_style_path|mech_about"""
-    try:
-        zcad_conn, mech_conn = get_cad_connection()
-        if scope == "cad":
+    if scope == "cad":
+        try:
+            zcad_conn, _ = get_cad_connection()
             app = zcad_conn.app
             info = {}
             for prop in ['Version', 'Name', 'Path', 'FullName', 'Caption',
@@ -2259,7 +2261,12 @@ def get_app_info(scope: str = "cad") -> dict:
                     except Exception:
                         pass
             return _ok(data=info)
-        elif scope == "mech_version":
+        except Exception as e:
+            return _err(f"获取应用信息({scope})", e)
+
+    def operation():
+        _, mech_conn = get_cad_connection()
+        if scope == "mech_version":
             return _ok(version=mech_conn.zwm_app.get_version())
         elif scope == "mech_cad_path":
             return _ok(path=mech_conn.zwm_app.get_cad_path())
@@ -2270,25 +2277,15 @@ def get_app_info(scope: str = "cad") -> dict:
         elif scope == "mech_about":
             return _ok(about=mech_conn.zwm_app.get_about())
         return _err("获取信息", ValueError(f"不支持的scope: {scope}"))
-    except Exception as e:
-        return _err(f"获取应用信息({scope})", e)
+
+    return _run_mechanical(f"获取应用信息({scope})", operation, read_only=True)
 
 
 @mcp.tool
 def mech_diagnose() -> dict:
-    """诊断机械模块连接与 ZwmToolKit 类型库加载状态。
-
-    逐项探测：类型库加载、ZWCAD 应用、ZwmApp、ZwmDb、标题栏获取(依赖类型库)，返回各探测项状态与修复建议。
-    """
-    result = {}
-
-    loaded, source, tlb_err = _typelib_state()
-    result["typelib_loaded"] = loaded
-    result["typelib_source"] = source
-    if tlb_err:
-        result["typelib_error"] = str(tlb_err)
-
+    """诊断 pyzwcadmech/ZRX 后端选择、桥接和机械对象读取状态。"""
     reset_cad_connection()
+    result = _mechanical_backend.recheck_unavailable()
     try:
         zcad_conn, mech_conn = get_cad_connection()
     except Exception as e:
@@ -2297,41 +2294,30 @@ def mech_diagnose() -> dict:
         return _ok("诊断完成(连接建立失败)", **result)
 
     try:
-        _ = mech_conn.app
+        _ = zcad_conn.app
         result["cad_app_ok"] = True
     except Exception as e:
         result["cad_app_ok"] = False
         result["cad_app_error"] = str(e)
 
-    try:
-        _ = mech_conn.zwm_app
-        result["zwm_app_ok"] = True
-    except Exception as e:
-        result["zwm_app_ok"] = False
-        result["zwm_app_error"] = str(e)
-
-    try:
-        mech_conn.open_file("")
-        result["zwm_db_ok"] = True
-    except Exception as e:
-        result["zwm_db_ok"] = False
-        result["zwm_db_error"] = str(e)
-
-    if result.get("zwm_db_ok"):
+    if result.get("active_backend") != "unavailable":
         try:
+            result["zwm_version"] = mech_conn.zwm_app.get_version()
+            result["zwm_app_ok"] = True
+            mech_conn.open_file("")
+            result["zwm_db_ok"] = True
             title = mech_conn.get_title()
             result["title_probe_ok"] = title is not None
+            if title is not None:
+                result["title_field_count"] = title.get_item_count()
         except Exception as e:
-            result["title_probe_ok"] = False
-            result["title_probe_error"] = str(e)
-
-    if not loaded:
+            result["zwm_app_ok"] = False
+            result["zwm_db_ok"] = False
+            result["mechanical_probe_error"] = str(e)
+    else:
         result["hint"] = (
-            "ZwmToolKit 类型库未加载，标题栏/明细表/图框等机械接口不可用。"
-            "修复方法：1) 确认中望机械已正常安装；"
-            "2) 设置环境变量 PYZWCADMECH_TLB_PATH 指向 ZwmToolKit.tlb "
-            "(如 C:\\Program Files\\ZWSOFT\\ZWCAD Mechanical 2026 Chs\\Zwcadm\\ZwmToolKit.tlb)；"
-            "3) 调用 mech_diagnose 重新排查（已自动重置连接缓存）；4) 重启 MCP Server。"
+            "机械后端不可用。确认 ZWCAD 已启动、ZRX 文件路径正确，"
+            "并检查 startup_probe 与 zrx_error 字段。"
         )
     return _ok("诊断完成", **result)
 
@@ -2346,10 +2332,7 @@ def manage_title_block(action: str, params: dict = None) -> dict:
     """标题栏管理。action: get_info|get_field_count(无需params),
     set_field:{field_name,value} | update_batch:{fields:{name:val,...}}
     get_field_by_index:{index}"""
-    try:
-        _tlb_err = _require_typelib("标题栏管理")
-        if _tlb_err:
-            return _tlb_err
+    def operation():
         _, mech_conn = get_cad_connection()
         mech_conn.open_file("")
         title = mech_conn.get_title()
@@ -2394,8 +2377,12 @@ def manage_title_block(action: str, params: dict = None) -> dict:
             return _ok(data=f)
 
         return _err("标题栏操作", ValueError(f"不支持的操作: {action}"))
-    except Exception as e:
-        return _err(f"标题栏操作({action})", e)
+
+    return _run_mechanical(
+        f"标题栏操作({action})",
+        operation,
+        read_only=action in {"get_info", "get_field_count", "get_field_by_index"},
+    )
 
 
 @mcp.tool
@@ -2403,7 +2390,7 @@ def manage_frame(action: str, params: dict = None) -> dict:
     """图框管理。action: list|get_info|get_count|get_next_name|refresh(无需params),
     get_name_by_index:{index} | get_name_by_point:{x,y,[z]}
     switch:{frame_name} | update:{width,height,orientation,scale1,scale2,...}"""
-    try:
+    def operation():
         _, mech_conn = get_cad_connection()
         mech_conn.open_file("")
         p = params or {}
@@ -2472,8 +2459,15 @@ def manage_frame(action: str, params: dict = None) -> dict:
             return _ok("图框刷新成功")
 
         return _err("图框操作", ValueError(f"不支持的操作: {action}"))
-    except Exception as e:
-        return _err(f"图框操作({action})", e)
+
+    return _run_mechanical(
+        f"图框操作({action})",
+        operation,
+        read_only=action in {
+            "list", "get_info", "get_count", "get_name_by_index",
+            "get_name_by_point", "get_next_name",
+        },
+    )
 
 
 @mcp.tool
@@ -2489,7 +2483,7 @@ def manage_bom(action: str, params: dict = None) -> dict:
     持久化说明: 修改BOM数据后，内部自动调用refresh_bom()将更改写入DWG图纸。
     请勿在BOM修改后调用manage_mech_db的save操作，save会从图纸重载数据导致修改丢失。
     如需保存DWG文件到磁盘，请使用manage_document的save操作。"""
-    try:
+    def operation():
         _, mech_conn = get_cad_connection()
         mech_conn.open_file("")
         bom = mech_conn.zwm_db.get_bom()
@@ -2597,8 +2591,12 @@ def manage_bom(action: str, params: dict = None) -> dict:
             return _ok(f"批量更新完成: 成功{updated}行", updated=updated, failed=failed)
 
         return _err("明细表操作", ValueError(f"不支持的操作: {action}"))
-    except Exception as e:
-        return _err(f"明细表操作({action})", e)
+
+    return _run_mechanical(
+        f"明细表操作({action})",
+        operation,
+        read_only=action in {"get_row_count", "get_row", "get_field", "get_field_count"},
+    )
 
 
 @mcp.tool
@@ -2608,12 +2606,12 @@ def create_partlist() -> dict:
     当图纸中尚无明细表时调用此工具创建。参考官方SDK FormBom.cs，
     命令格式为 _.ZwmPartlist（下划线=语言无关，点=强制内置命令）。
     """
-    try:
+    def operation():
         _, mech_conn = get_cad_connection()
         mech_conn.zwm_app.send_command("_.ZwmPartlist\n")
         return _ok("成功创建明细表")
-    except Exception as e:
-        return _err("创建明细表", e)
+
+    return _run_mechanical("创建明细表", operation)
 
 
 @mcp.tool
@@ -2623,7 +2621,7 @@ def manage_mech_db(action: str, params: dict = None) -> dict:
     注意: save操作用于保存机械模块数据库到文件，其参数dwgVer为图纸版本号(默认33)。
     修改BOM/标题栏/图框后请使用各自的refresh方法(如manage_bom的refresh)持久化，
     不要调用save，因为save会从图纸重载数据导致修改丢失。"""
-    try:
+    def operation():
         _, mech_conn = get_cad_connection()
         p = params or {}
 
@@ -2642,14 +2640,14 @@ def manage_mech_db(action: str, params: dict = None) -> dict:
             return _ok("机械模块连接已关闭")
 
         return _err("机械数据库操作", ValueError(f"不支持的操作: {action}"))
-    except Exception as e:
-        return _err(f"机械数据库操作({action})", e)
+
+    return _run_mechanical(f"机械数据库操作({action})", operation)
 
 
 @mcp.tool
 def mech_doc(action: str, file_path: str, template: str = None) -> dict:
     """中望机械文档操作。action: open|new|new_named(需template参数)。"""
-    try:
+    def operation():
         _, mech_conn = get_cad_connection()
         if action == "open":
             mech_conn.zwm_app.open_doc(file_path)
@@ -2661,26 +2659,26 @@ def mech_doc(action: str, file_path: str, template: str = None) -> dict:
             mech_conn.zwm_app.new_named_doc(file_path, template)
             return _ok(f"成功新建命名文档: {file_path} (模板: {template})")
         return _err("机械文档操作", ValueError(f"不支持的操作: {action}"))
-    except Exception as e:
-        return _err(f"机械文档操作({action})", e)
+
+    return _run_mechanical(f"机械文档操作({action})", operation)
 
 
 @mcp.tool
 def cad_environment_init(std_name: str) -> dict:
     """初始化CAD环境标准（如GB, ISO, DIN等）。"""
-    try:
+    def operation():
         _, mech_conn = get_cad_connection()
         mech_conn.open_file("")
         mech_conn.zwm_db.cad_environment_init(std_name)
         return _ok(f"CAD 环境初始化成功 (标准: {std_name})", standard=std_name)
-    except Exception as e:
-        return _err("CAD 环境初始化", e)
+
+    return _run_mechanical("CAD 环境初始化", operation)
 
 
 @mcp.tool
 def get_balloon(text: str = "") -> dict:
     """获取球标对象（用于零件序号标注）。"""
-    try:
+    def operation():
         _, mech_conn = get_cad_connection()
         mech_conn.open_file("")
         balloon = mech_conn.zwm_db.get_balloon(text)
@@ -2688,8 +2686,8 @@ def get_balloon(text: str = "") -> dict:
             return _ok(f"成功获取球标对象: {balloon}")
         else:
             return _err("获取球标", ValueError("未获取到球标对象"))
-    except Exception as e:
-        return _err("获取球标", e)
+
+    return _run_mechanical("获取球标", operation, read_only=True)
 
 
 @mcp.tool
@@ -2718,12 +2716,11 @@ def insert_balloon(
     LISP 命令格式:
     (Zwm_BalloonInsert (list <mode> (list ax ay az) (list sx sy sz) "text" seq_type leader))
     """
-    try:
-        zcad_conn, _ = get_cad_connection()
+    if not (0 <= seq_type <= 6):
+        return _err("插入球标", ValueError(f"序号类型 seq_type 必须为 0-6，当前值: {seq_type}"))
 
-        if not (0 <= seq_type <= 6):
-            return _err("插入球标", ValueError(f"序号类型 seq_type 必须为 0-6，当前值: {seq_type}"))
-
+    def operation():
+        zcad_conn, mech_conn = get_cad_connection()
         def _fmt_coord(v):
             """格式化坐标值为 LISP 兼容的实数字符串。"""
             v = float(v)
@@ -2736,9 +2733,18 @@ def insert_balloon(
             f"(list {_fmt_coord(symbol_x)} {_fmt_coord(symbol_y)} {_fmt_coord(symbol_z)}) "
             f'"{text}" {seq_type} {leader_val}))'
         )
-        # \x03 = ESC（发送两次取消当前命令），\r = 回车执行
-        cmd = "\x03\x03" + lisp + "\r"
-        zcad_conn.doc.SendCommand(cmd)
+        if _mechanical_backend.backend == "zrx":
+            mech_conn.insert_balloon(
+                arrow=(arrow_x, arrow_y, arrow_z),
+                symbol=(symbol_x, symbol_y, symbol_z),
+                text=text,
+                seq_type=seq_type,
+                has_leader=has_leader,
+                mode=mode,
+            )
+        else:
+            # The primary implementation has always used the basic CAD LISP path.
+            zcad_conn.doc.SendCommand("\x03\x03" + lisp + "\r")
 
         return _ok(
             f"成功插入球标: {text}",
@@ -2750,8 +2756,8 @@ def insert_balloon(
             has_leader=has_leader,
             mode=mode,
         )
-    except Exception as e:
-        return _err("插入球标", e)
+
+    return _run_mechanical("插入球标", operation)
 
 
 @mcp.tool
@@ -2778,10 +2784,7 @@ def create_frame(
 ) -> dict:
     """新建图幅/图框。所有参数均可选，默认从XML配置读取。
     orientation: landscape|portrait。have_*: 各栏开关(dhl/fjl/btl/csl/ggl)。"""
-    try:
-        _tlb_err = _require_typelib("创建图框")
-        if _tlb_err:
-            return _tlb_err
+    def operation():
         _, mech_conn = get_cad_connection()
         mech_conn.open_file("")
 
@@ -2839,8 +2842,8 @@ def create_frame(
             f"成功创建图框: {name} (标准:{std_name}, 图幅:{frame_size_name})",
             frame_name=name, setattr_failures=failed,
         )
-    except Exception as e:
-        return _err("创建图框", e)
+
+    return _run_mechanical("创建图框", operation)
 
 
 # ############################################################
@@ -3092,5 +3095,14 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("ZWCAD Mechanical MCP Server 启动中...")
     logger.info("=" * 60)
+    backend_state = _mechanical_backend.preflight()
+    logger.info(
+        "机械后端预检完成: requested=%s active=%s generation=%s",
+        backend_state["requested_backend"],
+        backend_state["active_backend"],
+        backend_state["generation"],
+    )
+    if backend_state["active_backend"] == "unavailable":
+        logger.warning("机械后端不可用，服务将以基础 CAD 功能降级启动: %s", backend_state["fallback_reason"])
     logger.info("服务器已就绪，等待客户端连接...")
     mcp.run(transport="stdio", show_banner=False)
