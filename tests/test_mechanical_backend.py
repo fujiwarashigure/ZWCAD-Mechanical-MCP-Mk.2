@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import patch
+import os
+from unittest.mock import Mock, patch
 
 import mechanical_backend as backend_module
 from mechanical_backend import MechanicalBackendManager, is_failover_error
@@ -38,6 +39,26 @@ class MechanicalBackendManagerTests(unittest.TestCase):
             (backend_module.PROJECT_ROOT / "zrx" / "ZWMechMCP.zrx").resolve(),
             manager._resolve_zrx_path(),
         )
+
+    def test_use_zrx_switch_forces_zrx_backend(self):
+        with patch.dict(os.environ, {"ZWMECH_USE_ZRX": "1"}, clear=False):
+            manager = MechanicalBackendManager(probe=lambda: {"ok": True})
+
+        self.assertEqual("zrx", manager.mode)
+        self.assertTrue(manager.use_zrx_switch)
+        self.assertTrue(manager.snapshot()["zrx_switch_enabled"])
+
+    def test_use_zrx_switch_skips_pyzwcadmech_probe(self):
+        probe = Mock(side_effect=AssertionError("probe must be skipped"))
+        with patch.dict(os.environ, {"ZWMECH_USE_ZRX": "1"}, clear=False):
+            manager = MechanicalBackendManager(probe=probe)
+            manager._active_app = lambda: object()
+            manager._activate_zrx = lambda app: (True, None)
+
+            state = manager.preflight()
+
+        self.assertEqual("zrx", state["active_backend"])
+        probe.assert_not_called()
 
     def test_dual_failure_degrades_without_raising(self):
         manager = self._manager(lambda: {"ok": False, "error": "typelib unavailable"})

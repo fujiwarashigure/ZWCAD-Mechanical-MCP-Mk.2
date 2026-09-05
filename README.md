@@ -71,7 +71,7 @@ python server.py
 start.bat
 ```
 
-默认 `ZWMECH_BACKEND=auto` 会在服务启动时先探测 `pyzwcadmech`。如果 ZwmToolKit COM 接口不可用，服务会通过活动 ZWCAD 的 `Application.LoadZrx()` 自动加载 `ZWMechMCP.zrx`，再使用本机桥接执行机械接口；通常不需要预先手工加载插件。
+默认 `ZWMECH_USE_ZRX=0`，机械功能优先使用 `pyzwcadmech`；如果 ZwmToolKit COM 接口不可用，服务会通过活动 ZWCAD 的 `Application.LoadZrx()` 自动加载 `ZWMechMCP.zrx` 并回退到本机桥接。将 `ZWMECH_USE_ZRX` 设为 `1`（也接受 `true/on/yes`）可强制所有机械功能直接走 ZRX。
 
 ### 4. 配置 MCP 客户端
 
@@ -273,6 +273,7 @@ ZRX 回退流程如下：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
+| `ZWMECH_USE_ZRX` | `0` | 设为 `1`、`true`、`on` 或 `yes` 时强制所有机械功能使用 ZRX；默认优先使用 `pyzwcadmech`。 |
 | `ZWMECH_BACKEND` | `auto` | `auto`、`pyzwcadmech` 或 `zrx`。 |
 | `ZWMECH_ZRX_PATH` | `zrx\\ZWMechMCP.zrx` | ZRX 回退插件路径；相对路径以当前项目目录为基准，也支持绝对路径。 |
 | `ZWMECH_BRIDGE_HOST` | `127.0.0.1` | 本机桥接地址，建议保持回环地址。 |
@@ -286,6 +287,8 @@ python server.py
 ```
 
 默认 `auto` 不要求预先手工加载插件。若需恢复或调试，可在 ZWCAD 中执行 `ZRXLOAD`/`APPLOAD`，然后执行 `ZWMMECHSTATUS`。使用 `mech_diagnose` 可查看当前后端、探测步骤、切换原因、ZRX 路径、桥接信息以及两条路径的错误。
+
+调试两条路线时，建议分别使用 `ZWMECH_USE_ZRX=0`（默认，优先 COM）和 `ZWMECH_USE_ZRX=1`（强制 ZRX）。`ZWMECH_BACKEND` 仍可用于兼容旧配置或启用 `auto`、`pyzwcadmech`、`zrx` 模式。
 
 ## 示例：通过 AI 创建图框
 
@@ -630,6 +633,7 @@ Runtime switching is one-way from `pyzwcadmech` to ZRX. Read-only operations ret
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `ZWMECH_USE_ZRX` | `0` | Set to `1`, `true`, `on`, or `yes` to force all mechanical tools through ZRX; default prefers `pyzwcadmech`. |
 | `ZWMECH_BACKEND` | `auto` | `auto`, `pyzwcadmech`, or `zrx`. |
 | `ZWMECH_ZRX_PATH` | `zrx\\ZWMechMCP.zrx` | Fallback ZRX path; relative values are based on the project directory, and absolute values are also supported. |
 | `ZWMECH_BRIDGE_HOST` | `127.0.0.1` | Local bridge address; keep it loopback-only. |
@@ -643,6 +647,8 @@ python server.py
 ```
 
 In `auto` mode, preloading the plugin is normally unnecessary. For recovery or debugging, run `ZRXLOAD`/`APPLOAD` in ZWCAD and then `ZWMMECHSTATUS`. `mech_diagnose` reports the active backend, probe steps, fallback reason, ZRX path, bridge metadata, and errors from both routes.
+
+For route comparison, use `ZWMECH_USE_ZRX=0` (default, prefer COM) and `ZWMECH_USE_ZRX=1` (force ZRX). `ZWMECH_BACKEND` remains available for legacy configuration and explicit `auto`, `pyzwcadmech`, or `zrx` modes.
 
 ## Example: Creating a Frame via AI
 

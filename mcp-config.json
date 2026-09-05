@@ -1,9 +1,10 @@
 ﻿{
   "mcpServers": {
     "zwcadmech": {
-      "command": "G:\\work\\ZWCAD Mechanical MCP\\.venv\\Scripts\\python.exe",
+      "command": "python.exe",
       "args": ["server.py"],
       "env": {
+        "ZWMECH_USE_ZRX": "0",
         "ZWMECH_ZRX_PATH": "zrx\\ZWMechMCP.zrx"
       },
       "disabled": false,

@@ -18,6 +18,7 @@ from mech_bridge import MechBridge, MechBridgeError, ZwCADMech as BridgeZwCADMec
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_ZRX_PATH = Path("zrx") / "ZWMechMCP.zrx"
 VALID_BACKENDS = {"auto", "pyzwcadmech", "zrx"}
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 class MechanicalBackendError(RuntimeError):
@@ -158,7 +159,12 @@ class MechanicalBackendManager:
         zrx_path: str | os.PathLike[str] | None = None,
         probe: Callable[[], dict[str, Any]] | None = None,
     ):
-        requested_mode = (mode or os.environ.get("ZWMECH_BACKEND", "auto")).strip().lower()
+        switch_value = os.environ.get("ZWMECH_USE_ZRX", "0").strip().lower()
+        self.use_zrx_switch = switch_value in TRUTHY_ENV_VALUES
+        if mode is None and self.use_zrx_switch:
+            requested_mode = "zrx"
+        else:
+            requested_mode = (mode or os.environ.get("ZWMECH_BACKEND", "auto")).strip().lower()
         self.mode = requested_mode if requested_mode in VALID_BACKENDS else "auto"
         self._invalid_mode = requested_mode if requested_mode not in VALID_BACKENDS else None
         self.zrx_path = Path(zrx_path or os.environ.get("ZWMECH_ZRX_PATH", DEFAULT_ZRX_PATH))
@@ -185,6 +191,7 @@ class MechanicalBackendManager:
         with self._lock:
             return {
                 "requested_backend": self.mode,
+                "zrx_switch_enabled": self.use_zrx_switch,
                 "active_backend": self._backend,
                 "generation": self._generation,
                 "zrx_path": str(self.zrx_path),
@@ -275,8 +282,9 @@ class MechanicalBackendManager:
                     return self.snapshot()
                 reason = self._startup.get("error", "pyzwcadmech probe failed")
             else:
-                self._startup = {"ok": None, "skipped": "ZWMECH_BACKEND=zrx"}
-                reason = "ZWMECH_BACKEND=zrx"
+                switch_source = "ZWMECH_USE_ZRX=1" if self.use_zrx_switch else "ZWMECH_BACKEND=zrx"
+                self._startup = {"ok": None, "skipped": switch_source}
+                reason = switch_source
 
             try:
                 app = self._active_app()

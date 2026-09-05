@@ -2788,16 +2788,15 @@ def create_frame(
         _, mech_conn = get_cad_connection()
         mech_conn.open_file("")
 
-        if not std_name:
-            std_name = _get_default_standard()
-        if not frame_size_name:
-            frame_size_name = _get_default_frame_size(std_name)
-        if not title_style_name:
-            _, title_style_name = _get_title_styles(std_name)
-        if not bom_style_name:
-            _, bom_style_name = _get_bom_styles(std_name)
-        if not frame_style_name:
-            frame_style_name = _get_frame_styles(std_name, frame_size_name, orientation)
+        std = std_name or _get_default_standard()
+        size = frame_size_name or _get_default_frame_size(std)
+        title_style = title_style_name
+        if not title_style:
+            _, title_style = _get_title_styles(std)
+        bom_style = bom_style_name
+        if not bom_style:
+            _, bom_style = _get_bom_styles(std)
+        frame_style = frame_style_name or _get_frame_styles(std, size, orientation)
 
         frame_obj, name = mech_conn.zwm_db.get_next_frm_name()
         if not name:
@@ -2810,10 +2809,10 @@ def create_frame(
             return _ok("获取新图框对象失败", created=False)
 
         fields = {
-            "std_name": std_name, "frame_size_name": frame_size_name,
-            "frame_style_name": frame_style_name, "orientation": orientation,
+            "std_name": std, "frame_size_name": size,
+            "frame_style_name": frame_style, "orientation": orientation,
             "width": str(int(width)), "height": str(int(height)),
-            "title_style_name": title_style_name, "bom_style_name": bom_style_name,
+            "title_style_name": title_style, "bom_style_name": bom_style,
             "dhl_style_name": dhl_style_name, "fjl_style_name": fjl_style_name,
             "csl_style_name": csl_style_name, "ggl_style_name": ggl_style_name,
             "have_dhl": "1" if have_dhl else "0", "have_fjl": "1" if have_fjl else "0",
@@ -2839,7 +2838,7 @@ def create_frame(
         mech_conn.zwm_db.build_frame(511)
 
         return _ok(
-            f"成功创建图框: {name} (标准:{std_name}, 图幅:{frame_size_name})",
+            f"成功创建图框: {name} (标准:{std}, 图幅:{size})",
             frame_name=name, setattr_failures=failed,
         )
 
