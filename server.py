@@ -2850,6 +2850,29 @@ def create_frame(
 # ############################################################
 
 
+def _win32_cad_application():
+    """ZwCAD 的 GetXData 在 pyzwcad/comtypes 代理上参数签名不兼容，需走 pywin32。"""
+    import win32com.client
+    return win32com.client.GetActiveObject("ZwCAD.Application")
+
+
+def _serialize_xdata_values(values):
+    if values is None:
+        return []
+    out = []
+    for item in values:
+        out.append(list(item) if isinstance(item, tuple) else item)
+    return out
+
+
+def _read_entity_xdata(handle: str, app_name: str) -> tuple[list, list]:
+    doc = _win32_cad_application().ActiveDocument
+    types, values = doc.HandleToObject(handle).GetXData(app_name)
+    type_list = list(types) if types is not None else []
+    value_list = _serialize_xdata_values(values)
+    return type_list, value_list
+
+
 @mcp.tool
 def manage_dictionary(action: str, params: dict = None) -> dict:
     """命名对象字典与XRecord管理。action及params:
@@ -2995,10 +3018,7 @@ def manage_xdata(action: str, params: dict = None) -> dict:
             return _ok(f"成功注册应用程序: {p['app_name']}", app_name=p["app_name"])
 
         elif action == "get_xdata":
-            obj = zcad_conn.doc.HandleToObject(p["handle"])
-            types, values = obj.GetXData(p["app_name"])
-            type_list = list(types) if types else []
-            value_list = list(values) if values else []
+            type_list, value_list = _read_entity_xdata(p["handle"], p["app_name"])
             return _ok(data={"handle": p["handle"], "app_name": p["app_name"],
                              "types": type_list, "values": value_list})
 
